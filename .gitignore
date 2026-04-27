@@ -1,0 +1,38 @@
+# Dados e configurações pessoais (salvos em ~/.controle_cartao_ia/)
+*.db
+*.json
+config.json
+backups/
+
+# Arquivo de status da sessão de trabalho (nunca vai ao git)
+STATUS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+.env/
+
+# IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
