@@ -24,6 +24,7 @@ from .utils import (
     add_months, current_month, month_br_to_db, month_db_to_br,
     classify_expense, get_all_category_names, money, parse_money,
     current_year, DB_PATH, BACKUP_DIR,
+    invoice_month_for_date, invoice_period,
 )
 from .database import Database
 from .ai_advisor import AIAdvisor
@@ -405,6 +406,69 @@ def _apply_style(root: Tk):
 
 
 # ===========================================================================
+def _ask_closing_day(root, config: dict, card_hint: str = "") -> tuple[str, int] | tuple[None, None]:
+    """
+    Mostra diálogo para o usuário informar o cartão e o dia de fechamento.
+    Pré-preenche com o valor salvo para o cartão (ou padrão).
+    Retorna (card_name, closing_day) ou (None, None) se cancelado.
+    """
+    closing_days: dict = config.get("card_closing_days", {})
+    default_day: int = config.get("default_closing_day", 25)
+
+    result: list = [None, None]
+
+    dlg = Toplevel(root)
+    dlg.title("Dia de fechamento da fatura")
+    dlg.geometry("380x190")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+
+    Label(dlg, text="Cartão (ex: Nubank, Itaú — opcional):",
+          font=FONT_SMALL).pack(anchor=W, padx=16, pady=(14, 2))
+    card_var = StringVar(value=card_hint)
+    card_entry = Entry(dlg, textvariable=card_var, width=32, font=FONT_NORMAL)
+    card_entry.pack(anchor=W, padx=16)
+
+    Label(dlg, text="Dia de fechamento (1–31):",
+          font=FONT_SMALL).pack(anchor=W, padx=16, pady=(10, 2))
+    day_var = StringVar(value=str(closing_days.get(card_hint, default_day)))
+    day_entry = Entry(dlg, textvariable=day_var, width=8, font=FONT_NORMAL)
+    day_entry.pack(anchor=W, padx=16)
+
+    def _on_card_change(*_):
+        card = card_var.get().strip()
+        if card in closing_days:
+            day_var.set(str(closing_days[card]))
+
+    card_var.trace_add("write", _on_card_change)
+
+    def confirm():
+        try:
+            day = int(day_var.get().strip())
+            if not 1 <= day <= 31:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erro", "Informe um dia válido entre 1 e 31.", parent=dlg)
+            return
+        card = card_var.get().strip() or "PDF"
+        result[0] = card
+        result[1] = day
+        config.setdefault("card_closing_days", {})[card] = day
+        config["default_closing_day"] = day
+        save_config(config)
+        dlg.destroy()
+
+    btn = Frame(dlg)
+    btn.pack(pady=14)
+    Button(btn, text="Confirmar", command=confirm,
+           bg=CLR_OK, fg="white", relief="flat", padx=12).pack(side=LEFT, padx=6)
+    Button(btn, text="Cancelar", command=dlg.destroy,
+           relief="flat", padx=12).pack(side=LEFT)
+
+    dlg.wait_window()
+    return result[0], result[1]
+
+
 _MESES_PT: dict[str, int] = {
     "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
     "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
@@ -926,16 +990,24 @@ class CreditCardApp:
 
         # Insight
         cat_rows = self.db.get_category_totals(month)
+        # Período do ciclo da fatura
+        closing_day = self.config.get("default_closing_day", 25)
+        m_parts = month.split("-")
+        p_start, p_end = invoice_period(int(m_parts[0]), int(m_parts[1]), closing_day)
+        periodo = f"{p_start.strftime('%d/%m')} a {p_end.strftime('%d/%m/%Y')}"
+
         if cat_rows:
             top_cat = cat_rows[0]
-            status  = "✅ Situação dentro da meta." if percent < 80 else (
-                      "⚠️ Atenção: perto da meta!" if percent < 100 else "🚨 Meta ultrapassada!")
+            status  = "✅ Dentro da meta." if percent < 80 else (
+                      "⚠️ Perto da meta!" if percent < 100 else "🚨 Meta ultrapassada!")
             self.insight_var.set(
-                f"Mês: {month_br}  |  Maior categoria: {top_cat['category']} ({money(top_cat['total'])})  |  "
+                f"Fatura {month_br} ({periodo})  |  Maior categoria: {top_cat['category']} ({money(top_cat['total'])})  |  "
                 f"Uso da meta: {percent:.1f}%  |  {status}"
             )
         else:
-            self.insight_var.set(f"Mês: {month_br}  |  Sem lançamentos. Importe uma fatura ou cadastre gastos manualmente.")
+            self.insight_var.set(
+                f"Fatura {month_br} ({periodo})  |  Sem lançamentos. Importe uma fatura ou cadastre gastos manualmente."
+            )
 
         # Limpa e reconstrói gráficos
         for w in self.chart_frame.winfo_children():
@@ -1114,7 +1186,13 @@ class CreditCardApp:
             if installments < 1:
                 raise ValueError("Número de parcelas inválido.")
 
-            self.db.add_expense(date, description, amount, category, card, installments, notes)
+            closing = self.config.get("card_closing_days", {}).get(
+                card, self.config.get("default_closing_day", 25)
+            )
+            exp_date  = dt.date.fromisoformat(date)
+            inv_month = invoice_month_for_date(exp_date, closing)
+            self.db.add_expense(date, description, amount, category, card,
+                                installments, notes, invoice_month=inv_month)
 
             # limpa só os campos de valor e descrição
             self.f_desc.delete(0, END)
@@ -1210,12 +1288,19 @@ class CreditCardApp:
         if not file_paths:
             return
 
+        # Pergunta o cartão e dia de fechamento antes de processar
+        card_hint = re.sub(r"[_\-\d]", " ", Path(file_paths[0]).stem).strip()
+        card, closing_day = _ask_closing_day(self.root, self.config, card_hint)
+        if card is None:
+            return  # usuário cancelou
+
         # Um arquivo: fluxo normal com janela de revisão
         if len(file_paths) == 1:
             try:
-                ref_month_str = month_br_to_db(self.month_var.get())
-                ref_year  = int(ref_month_str[:4])
-                ref_month = int(ref_month_str[5:7])
+                stem = Path(file_paths[0]).stem.lower()
+                ano_match = re.search(r"20\d{2}", stem)
+                ref_year  = int(ano_match.group()) if ano_match else dt.date.today().year
+                ref_month = _mes_do_nome(stem) or int(month_br_to_db(self.month_var.get())[5:7])
                 expenses, raw_text = parse_pdf_invoice(
                     file_paths[0],
                     self.db.get_custom_categories(),
@@ -1233,6 +1318,7 @@ class CreditCardApp:
                 _PDFReviewDialog(
                     self.root, expenses, raw_text, self.db,
                     self.db.get_custom_categories(), self.ai, self.refresh_all,
+                    card=card, closing_day=closing_day,
                 )
             except Exception as exc:
                 messagebox.showerror("Erro ao importar PDF", str(exc))
@@ -1249,23 +1335,26 @@ class CreditCardApp:
                 stem = Path(fp).stem.lower()
                 ano_match = re.search(r"20\d{2}", stem)
                 ref_year = int(ano_match.group()) if ano_match else dt.date.today().year
-                ref_month = _mes_do_nome(stem)
+                ref_month_num = _mes_do_nome(stem)
                 expenses, _ = parse_pdf_invoice(
                     fp, custom_cats,
                     reference_year=ref_year,
-                    reference_month=ref_month,
+                    reference_month=ref_month_num,
                 )
                 for exp in expenses:
                     inst_num   = exp.get("installment_number", 1)
                     inst_total = exp.get("installments", 1)
-                    if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card="PDF"):
+                    if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card=card):
                         total_skipped += 1
                         continue
+                    exp_date = dt.date.fromisoformat(exp["date"])
+                    inv_month = invoice_month_for_date(exp_date, closing_day)
                     self.db.add_expense_raw(
                         exp["date"], exp["description"], exp["amount"],
-                        exp["category"], card="PDF",
+                        exp["category"], card=card,
                         installments=inst_total,
                         installment_number=inst_num,
+                        invoice_month=inv_month,
                     )
                     total_imported += 1
             except Exception as exc:
@@ -1933,13 +2022,16 @@ class _PDFReviewDialog:
     """Mostra os gastos extraídos do PDF para revisão antes de salvar."""
 
     def __init__(self, root, expenses: list[dict], raw_text: str,
-                 db: Database, custom_cats: dict, ai: AIAdvisor, on_save):
+                 db: Database, custom_cats: dict, ai: AIAdvisor, on_save,
+                 card: str = "PDF", closing_day: int = 25):
         self.db = db
         self.expenses = expenses
         self.on_save = on_save
         self.ai = ai
         self.raw_text = raw_text
         self.custom_cats = custom_cats
+        self.card = card
+        self.closing_day = closing_day
 
         dlg = Toplevel(root)
         dlg.title(f"Revisão de importação PDF — {len(expenses)} gastos encontrados")
@@ -1949,8 +2041,12 @@ class _PDFReviewDialog:
 
         Label(dlg, text=f"PDF importado: {len(expenses)} lançamentos identificados",
               font=FONT_HEADER).pack(anchor=W, padx=10, pady=8)
-        Label(dlg, text="Revise abaixo. Duplo clique para editar. Depois clique em Salvar tudo.",
-              font=FONT_SMALL, fg=CLR_MUTED).pack(anchor=W, padx=10)
+        Label(
+            dlg,
+            text=f"Cartão: {card}  |  Fechamento: dia {closing_day}  —  "
+                 "Revise abaixo. Duplo clique para editar. Depois clique em Salvar tudo.",
+            font=FONT_SMALL, fg=CLR_MUTED,
+        ).pack(anchor=W, padx=10)
 
         # Treeview de revisão
         cols = ("date", "description", "amount", "category", "parcela")
@@ -2058,16 +2154,18 @@ class _PDFReviewDialog:
             inst_num   = exp.get("installment_number", 1)
             inst_total = exp.get("installments", 1)
             if self.db.expense_exists(
-                exp["date"], exp["description"], exp["amount"], card="PDF",
+                exp["date"], exp["description"], exp["amount"], card=self.card,
             ):
                 skipped += 1
                 continue
-            # Salva o lançamento bruto exatamente como aparece na fatura
+            exp_date  = dt.date.fromisoformat(exp["date"])
+            inv_month = invoice_month_for_date(exp_date, self.closing_day)
             self.db.add_expense_raw(
                 exp["date"], exp["description"], exp["amount"],
-                exp["category"], card="PDF",
+                exp["category"], card=self.card,
                 installments=inst_total,
                 installment_number=inst_num,
+                invoice_month=inv_month,
             )
             imported += 1
         self.on_save()

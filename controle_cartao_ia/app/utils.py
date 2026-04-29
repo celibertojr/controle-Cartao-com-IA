@@ -27,6 +27,8 @@ DEFAULT_CONFIG = {
     "user_phone": "",
     "password_hash": "",
     "recovery_hash": "",
+    "default_closing_day": 25,
+    "card_closing_days": {},
 }
 
 # Categorias padrão com palavras-chave em português
@@ -127,6 +129,39 @@ def generate_recovery_key() -> str:
 # ---------------------------------------------------------------------------
 # Datas
 # ---------------------------------------------------------------------------
+
+def _clamp_day(year: int, month: int, day: int) -> dt.date:
+    """Retorna a data com o dia dado, reduzindo até ser válido (ex: 31 em fevereiro → 28/29)."""
+    while day > 0:
+        try:
+            return dt.date(year, month, day)
+        except ValueError:
+            day -= 1
+    raise ValueError(f"Data inválida: {year}-{month}-??")
+
+
+def invoice_month_for_date(date: dt.date, closing_day: int) -> str:
+    """
+    Retorna o mês da fatura (AAAA-MM) de uma transação dado o dia de fechamento.
+    Ex: closing_day=25, date=28/04 → '2026-05'  (vai para a fatura de maio)
+        closing_day=25, date=20/05 → '2026-05'  (fica na fatura de maio)
+        closing_day=25, date=25/05 → '2026-05'  (dia do fechamento ainda é deste mês)
+    """
+    if date.day > closing_day:
+        return add_months(date, 1).strftime("%Y-%m")
+    return date.strftime("%Y-%m")
+
+
+def invoice_period(year: int, month: int, closing_day: int) -> tuple[dt.date, dt.date]:
+    """
+    Retorna (data_início, data_fim) do ciclo de fatura.
+    Ex: year=2026, month=5, closing_day=25 → (2026-04-26, 2026-05-25)
+    """
+    end   = _clamp_day(year, month, closing_day)
+    prev  = add_months(dt.date(year, month, 1), -1)
+    start = _clamp_day(prev.year, prev.month, closing_day) + dt.timedelta(days=1)
+    return start, end
+
 
 def add_months(date_obj: dt.date, months: int) -> dt.date:
     """Avança N meses numa data, respeitando o último dia do mês."""
