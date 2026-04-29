@@ -66,45 +66,11 @@ class Database:
         installments: int = 1,
         notes: str = "",
     ):
-        """Adiciona gasto. Se parcelado, cria todas as parcelas futuras."""
-        cur = self.conn.cursor()
-        created_at = dt.datetime.now().isoformat(timespec="seconds")
-        base_date = dt.datetime.strptime(date, "%Y-%m-%d").date()
-
-        if installments <= 1:
-            cur.execute(
-                """
-                INSERT INTO expenses
-                    (date, description, amount, category, card,
-                     installments, installment_number, parent_id, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, 1, NULL, ?, ?)
-                """,
-                (date, description, amount, category, card, notes, created_at),
-            )
-        else:
-            monthly_value = round(amount / installments, 2)
-            parent_id = None
-            for i in range(installments):
-                parcel_date = add_months(base_date, i).strftime("%Y-%m-%d")
-                desc = f"{description} ({i + 1}/{installments})"
-                cur.execute(
-                    """
-                    INSERT INTO expenses
-                        (date, description, amount, category, card,
-                         installments, installment_number, parent_id, notes, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (parcel_date, desc, monthly_value, category, card,
-                     installments, i + 1, parent_id, notes, created_at),
-                )
-                if i == 0:
-                    parent_id = cur.lastrowid
-                    cur.execute(
-                        "UPDATE expenses SET parent_id = ? WHERE id = ?",
-                        (parent_id, parent_id),
-                    )
-
-        self.conn.commit()
+        """Adiciona gasto. Para parcelados, insere apenas a parcela atual (1/N); parcelas futuras são inferidas."""
+        installments = max(1, installments)
+        monthly_value = round(amount / installments, 2) if installments > 1 else amount
+        self.add_expense_raw(date, description, monthly_value, category, card,
+                             installments, 1, notes)
 
     def edit_expense(
         self,
@@ -181,6 +147,31 @@ class Database:
         self.conn.execute("DELETE FROM monthly_goals")
         self.conn.commit()
 
+    def add_expense_raw(
+        self,
+        date: str,
+        description: str,
+        amount: float,
+        category: str,
+        card: str = "",
+        installments: int = 1,
+        installment_number: int = 1,
+        notes: str = "",
+    ):
+        """Insere um único lançamento sem expandir parcelas (usado na importação de PDF)."""
+        created_at = dt.datetime.now().isoformat(timespec="seconds")
+        self.conn.execute(
+            """
+            INSERT INTO expenses
+                (date, description, amount, category, card,
+                 installments, installment_number, parent_id, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (date, description, amount, category, card,
+             installments, installment_number, notes, created_at),
+        )
+        self.conn.commit()
+
     def clear_expenses(self):
         self.conn.execute("DELETE FROM expenses")
         self.conn.commit()
@@ -242,14 +233,59 @@ class Database:
         ).fetchall()
 
     def get_future_commitments(self, start_month: str, months_ahead: int = 12):
-        return self.conn.execute(
-            """
-            SELECT substr(date,1,7) AS month, COALESCE(SUM(amount),0) AS total
-            FROM expenses WHERE substr(date,1,7) >= ?
-            GROUP BY substr(date,1,7) ORDER BY month ASC LIMIT ?
-            """,
-            (start_month, months_ahead),
+        """
+        Calcula comprometimentos futuros a partir dos lançamentos brutos.
+        Infere parcelas restantes sem duplicar entradas já registradas no banco.
+        Retorna lista de dicts {"month": "AAAA-MM", "total": float}.
+        """
+        all_rows = self.conn.execute(
+            "SELECT date, description, amount, installments, installment_number "
+            "FROM expenses ORDER BY date ASC"
         ).fetchall()
+
+        # Chave (desc_lower, total, num, mês) para detectar duplicatas
+        recorded: set[tuple] = {
+            (
+                (r["description"] or "").strip().lower(),
+                r["installments"] or 1,
+                r["installment_number"] or 1,
+                r["date"][:7],
+            )
+            for r in all_rows
+        }
+
+        totals: dict[str, float] = defaultdict(float)
+
+        for row in all_rows:
+            totals[row["date"][:7]] += float(row["amount"])
+
+            n_total = row["installments"] or 1
+            n_current = row["installment_number"] or 1
+            remaining = n_total - n_current
+            if remaining <= 0:
+                continue
+
+            desc_lower = (row["description"] or "").strip().lower()
+            base_date = dt.datetime.strptime(row["date"], "%Y-%m-%d").date()
+
+            # Não projeta se o próximo da cadeia já foi registrado (evita dupla contagem)
+            next_month = add_months(base_date, 1).strftime("%Y-%m")
+            if (desc_lower, n_total, n_current + 1, next_month) in recorded:
+                continue
+
+            for offset in range(1, remaining + 1):
+                future_date = add_months(base_date, offset)
+                future_month = future_date.strftime("%Y-%m")
+                future_inst_num = n_current + offset
+                # Projeta apenas parcelas ainda não registradas
+                if (desc_lower, n_total, future_inst_num, future_month) not in recorded:
+                    totals[future_month] += float(row["amount"])
+
+        result = sorted(
+            [{"month": m, "total": t} for m, t in totals.items() if m >= start_month],
+            key=lambda x: x["month"],
+        )
+        return result[:months_ahead]
 
     def get_recurring_expenses(self, min_months: int = 2, limit: int = 8):
         rows = self.conn.execute(

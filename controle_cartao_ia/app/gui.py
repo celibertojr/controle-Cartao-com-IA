@@ -6,9 +6,11 @@ Interface gráfica principal do Controle de Cartão de Crédito com IA.
 """
 
 import json
+import re
 import shutil
 import threading
 import datetime as dt
+from pathlib import Path
 from tkinter import (
     Tk, Toplevel, Frame, Label, Button, Entry, Text, StringVar, DoubleVar,
     IntVar, BooleanVar, filedialog, messagebox, END, BOTH, LEFT, RIGHT, X,
@@ -403,6 +405,23 @@ def _apply_style(root: Tk):
 
 
 # ===========================================================================
+_MESES_PT: dict[str, int] = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+
+def _mes_do_nome(texto: str) -> int | None:
+    """Extrai o mês (1-12) a partir do nome de um arquivo/string em português."""
+    for nome, num in _MESES_PT.items():
+        if nome in texto:
+            return num
+    return None
+
+
+# ===========================================================================
 # Aplicativo principal
 # ===========================================================================
 
@@ -697,21 +716,72 @@ class CreditCardApp:
     # ------------------------------------------------------------------
 
     def _build_future_tab(self):
-        Label(self.tab_future, text="Compromissos futuros (parcelas e lançamentos)",
-              font=FONT_HEADER, bg=CLR_BG, fg=CLR_TEXT).pack(anchor=W, padx=12, pady=(10, 4))
+        Label(self.tab_future, text="Compromissos futuros",
+              font=FONT_HEADER, bg=CLR_BG, fg=CLR_TEXT).pack(anchor=W, padx=12, pady=(10, 2))
         Label(
             self.tab_future,
-            text="Cada mês abaixo usa sua própria meta. Meses passados ficam congelados; "
-                 "meses atual e futuros seguem a meta atual, salvo quando você definir uma meta específica.",
-            font=FONT_SMALL,
-            bg=CLR_BG,
-            fg=CLR_MUTED,
-            justify=LEFT,
-            wraplength=980,
+            text="Clique em um mês para ver os lançamentos comprometidos. "
+                 "Metas passadas ficam congeladas; meses atual e futuros seguem a meta atual.",
+            font=FONT_SMALL, bg=CLR_BG, fg=CLR_MUTED, justify=LEFT, wraplength=980,
         ).pack(anchor=W, padx=12, pady=(0, 6))
-        self.future_text = Text(self.tab_future, wrap=WORD, font=FONT_MONO,
-                                bg=CLR_CARD, fg=CLR_TEXT, relief="groove", bd=1, padx=8, pady=6)
-        self.future_text.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
+
+        # --- Tabela resumo por mês ---
+        top_frame = Frame(self.tab_future, bg=CLR_BG)
+        top_frame.pack(fill=BOTH, expand=True, padx=10, pady=(0, 4))
+
+        cols_s = ("month", "goal", "committed", "pct", "available", "status")
+        self.future_tree = ttk.Treeview(top_frame, columns=cols_s, show="headings",
+                                        height=8, selectmode="browse")
+        for col, heading, width, anchor in [
+            ("month",     "Mês",           100, W),
+            ("goal",      "Meta",          110, W),
+            ("committed", "Comprometido",  120, W),
+            ("pct",       "% da Meta",      80, W),
+            ("available", "Folga",         120, W),
+            ("status",    "Status",         60, W),
+        ]:
+            self.future_tree.heading(col, text=heading, anchor=anchor)
+            self.future_tree.column(col, width=width, anchor=anchor, stretch=True)
+
+        vsb_s = ttk.Scrollbar(top_frame, orient="vertical", command=self.future_tree.yview)
+        self.future_tree.configure(yscrollcommand=vsb_s.set)
+        self.future_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        vsb_s.pack(side=RIGHT, fill=Y)
+        self.future_tree.bind("<<TreeviewSelect>>", self._on_future_month_select)
+
+        # Cores por status
+        self.future_tree.tag_configure("danger", background="#fdecea")
+        self.future_tree.tag_configure("warn",   background="#fff8e1")
+        self.future_tree.tag_configure("ok",     background="#f1f8f1")
+
+        # --- Tabela detalhe do mês selecionado ---
+        self.future_detail_label = Label(
+            self.tab_future,
+            text="Selecione um mês acima para ver os lançamentos comprometidos.",
+            font=FONT_SMALL, bg=CLR_BG, fg=CLR_MUTED, anchor=W,
+        )
+        self.future_detail_label.pack(anchor=W, padx=12, pady=(4, 2))
+
+        bot_frame = Frame(self.tab_future, bg=CLR_BG)
+        bot_frame.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
+
+        cols_d = ("date", "description", "amount", "category", "parcela")
+        self.future_detail_tree = ttk.Treeview(bot_frame, columns=cols_d, show="headings",
+                                               height=7, selectmode="browse")
+        for col, heading, width in [
+            ("date",        "Data",        90),
+            ("description", "Descrição",  380),
+            ("amount",      "Valor",       110),
+            ("category",    "Categoria",   150),
+            ("parcela",     "Parcela",      70),
+        ]:
+            self.future_detail_tree.heading(col, text=heading, anchor=W)
+            self.future_detail_tree.column(col, width=width, anchor=W, stretch=True)
+
+        vsb_d = ttk.Scrollbar(bot_frame, orient="vertical", command=self.future_detail_tree.yview)
+        self.future_detail_tree.configure(yscrollcommand=vsb_d.set)
+        self.future_detail_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        vsb_d.pack(side=RIGHT, fill=Y)
 
     # ------------------------------------------------------------------
     # Tab Análise IA
@@ -821,14 +891,14 @@ class CreditCardApp:
 
     def _update_expense_month_options(self):
         current = self.month_var.get().strip()
-        months = [current]
-        for row in reversed(self.db.get_all_month_totals()):
-            month_br = month_db_to_br(row["month"])
-            if month_br not in months:
-                months.append(month_br)
+        # get_all_month_totals retorna em ASC (AAAA-MM) — inverte para mais recente primeiro
+        months = [month_db_to_br(r["month"]) for r in self.db.get_all_month_totals()]
+        months = list(reversed(months))
+        if current not in months:
+            months.insert(0, current)
         self.expense_month_combo["values"] = months
         if self.expense_month_var.get().strip() not in months:
-            self.expense_month_var.set(current)
+            self.expense_month_var.set(months[0] if months else current)
 
     def refresh_dashboard(self):
         month_br = self.month_var.get().strip()
@@ -878,7 +948,7 @@ class CreditCardApp:
 
         month_rows = self.db.get_all_month_totals()
         year_rows  = self.db.get_year_totals()
-        top_rows   = self.db.get_top_expenses(month, limit=8)
+        top_rows   = self.db.get_top_expenses(month, limit=10)
 
         row1 = Frame(self.chart_frame, bg=CLR_BG)
         row1.pack(fill=BOTH, expand=True)
@@ -889,17 +959,29 @@ class CreditCardApp:
             labels = [r["category"] for r in cat_rows]
             totals = [float(r["total"]) for r in cat_rows]
             charts.embed_figure(charts.make_pie_chart(labels, totals, f"Categorias — {month_br}"), row1)
-            charts.embed_figure(charts.make_goal_chart(total, goal, f"Meta x Gasto — {month_br}"), row1)
 
         if top_rows:
-            t_labels = [f"{r['description'][:25]}" for r in top_rows]
+            # Rótulo: data + descrição + categoria em duas linhas
+            default_goal = self.config.get("monthly_goal", 3000.0)
+            t_labels = [
+                f"{r['date'][5:]}  {r['description'][:22]}\n{r['category'][:18]}"
+                for r in top_rows
+            ]
             t_values = [float(r["amount"]) for r in top_rows]
-            charts.embed_figure(charts.make_top_expenses_chart(t_labels, t_values, "Maiores gastos do mês"), row1)
+            charts.embed_figure(
+                charts.make_top_expenses_chart(t_labels, t_values, f"Maiores gastos — {month_br}", figsize=(5.8, 3.8)),
+                row1,
+            )
 
         if month_rows:
+            default_goal = self.config.get("monthly_goal", 3000.0)
             m_labels = [month_db_to_br(r["month"]) for r in month_rows]
-            m_values = [float(r["total"]) for r in month_rows]
-            charts.embed_figure(charts.make_bar_chart(m_labels, m_values, "Evolução mês a mês", "Mês"), row2)
+            m_gastos = [float(r["total"]) for r in month_rows]
+            m_metas  = [self.db.get_goal(r["month"], default_goal) for r in month_rows]
+            charts.embed_figure(
+                charts.make_line_chart(m_labels, m_gastos, m_metas, "Evolução mês a mês  (gasto vs meta)"),
+                row2,
+            )
 
         if year_rows:
             y_labels = [r["year"] for r in year_rows]
@@ -942,48 +1024,73 @@ class CreditCardApp:
             ))
 
     def refresh_future(self):
+        for item in self.future_tree.get_children():
+            self.future_tree.delete(item)
+        for item in self.future_detail_tree.get_children():
+            self.future_detail_tree.delete(item)
+        self.future_detail_label.config(
+            text="Selecione um mês acima para ver os lançamentos comprometidos."
+        )
+
         month = month_br_to_db(self.month_var.get())
         months_ahead = 12
-        rows = {
+        committed_map = {
             row["month"]: float(row["total"])
             for row in self.db.get_future_commitments(month, months_ahead=18)
         }
         base_month = dt.datetime.strptime(month + "-01", "%Y-%m-%d").date()
-        recurring = self.db.get_recurring_expenses(min_months=2, limit=8)
-
-        self.future_text.config(state=NORMAL)
-        self.future_text.delete("1.0", END)
-        self.future_text.insert(END, "Projeção dos próximos meses com base na meta vigente de cada mês:\n\n")
 
         for i in range(months_ahead):
             month_date = add_months(base_month, i)
-            month_key = month_date.strftime("%Y-%m")
-            month_goal = self.db.get_goal(month_key, self.config.get("monthly_goal", 3000.0))
-            committed = rows.get(month_key, 0.0)
-            available = month_goal - committed
-            percent = (committed / month_goal * 100) if month_goal > 0 else 0.0
-            status = "🚨" if percent >= 100 else ("⚠️" if percent >= 80 else "✅")
-            self.future_text.insert(
-                END,
-                f"{status} {month_db_to_br(month_key)}\n"
-                f"   Meta do mês        : {money(month_goal)}\n"
-                f"   Já comprometido    : {money(committed)} ({percent:.1f}% da meta)\n"
-                f"   Ainda pode gastar  : {money(available)}\n\n"
+            month_key  = month_date.strftime("%Y-%m")
+            goal       = self.db.get_goal(month_key, self.config.get("monthly_goal", 3000.0))
+            committed  = committed_map.get(month_key, 0.0)
+            available  = goal - committed
+            pct        = (committed / goal * 100) if goal > 0 else 0.0
+            if pct >= 100:
+                status, tag = "🚨 Estourou", "danger"
+            elif pct >= 80:
+                status, tag = "⚠️ Atenção", "warn"
+            else:
+                status, tag = "✅ OK", "ok"
+            self.future_tree.insert("", END, iid=month_key, tags=(tag,), values=(
+                month_db_to_br(month_key),
+                money(goal),
+                money(committed),
+                f"{pct:.1f}%",
+                money(available),
+                status,
+            ))
+
+    def _on_future_month_select(self, _event=None):
+        sel = self.future_tree.selection()
+        if not sel:
+            return
+        month_key = sel[0]
+        self._refresh_future_detail(month_key)
+
+    def _refresh_future_detail(self, month_key: str):
+        for item in self.future_detail_tree.get_children():
+            self.future_detail_tree.delete(item)
+        rows = self.db.list_expenses(month_key)
+        month_br = month_db_to_br(month_key)
+        if rows:
+            self.future_detail_label.config(
+                text=f"Lançamentos comprometidos em {month_br} ({len(rows)} itens):"
             )
-
-        self.future_text.insert(END, "Possíveis gastos rotineiros detectados no histórico:\n\n")
-        if recurring:
-            for row in recurring:
-                self.future_text.insert(
-                    END,
-                    f"• {row['description']} | {row['category']} | "
-                    f"apareceu em {row['months']} meses | média {money(row['avg_per_month'])}/mês | "
-                    f"último registro {row['last_date']}\n"
-                )
+            for row in rows:
+                parcela = f"{row['installment_number']}/{row['installments']}"
+                self.future_detail_tree.insert("", END, values=(
+                    row["date"],
+                    row["description"],
+                    money(row["amount"]),
+                    row["category"],
+                    parcela,
+                ))
         else:
-            self.future_text.insert(END, "Nenhum padrão recorrente forte identificado ainda.\n")
-
-        self.future_text.config(state=DISABLED)
+            self.future_detail_label.config(
+                text=f"{month_br}: nenhum lançamento comprometido registrado."
+            )
 
     # ------------------------------------------------------------------
     # Ações — gastos
@@ -1096,39 +1203,79 @@ class CreditCardApp:
                                  "Instale pdfplumber para importar PDFs:\npip install pdfplumber")
             return
 
-        file_path = filedialog.askopenfilename(
-            title="Selecione a fatura em PDF",
+        file_paths = filedialog.askopenfilenames(
+            title="Selecione uma ou mais faturas em PDF",
             filetypes=[("PDF", "*.pdf"), ("Todos", "*.*")],
         )
-        if not file_path:
+        if not file_paths:
             return
 
-        try:
-            ref_month = month_br_to_db(self.month_var.get())
-            ref_year = int(ref_month[:4])
-            expenses, raw_text = parse_pdf_invoice(
-                file_path,
-                self.db.get_custom_categories(),
-                reference_year=ref_year,
-            )
+        # Um arquivo: fluxo normal com janela de revisão
+        if len(file_paths) == 1:
+            try:
+                ref_month_str = month_br_to_db(self.month_var.get())
+                ref_year  = int(ref_month_str[:4])
+                ref_month = int(ref_month_str[5:7])
+                expenses, raw_text = parse_pdf_invoice(
+                    file_paths[0],
+                    self.db.get_custom_categories(),
+                    reference_year=ref_year,
+                    reference_month=ref_month,
+                )
+                if not expenses:
+                    if messagebox.askyesno(
+                        "Sem resultados automáticos",
+                        "Nenhum gasto foi identificado automaticamente.\n"
+                        "Deseja enviar o texto do PDF para a IA tentar extrair os gastos?",
+                    ):
+                        self._ask_ai_to_parse_pdf(raw_text)
+                    return
+                _PDFReviewDialog(
+                    self.root, expenses, raw_text, self.db,
+                    self.db.get_custom_categories(), self.ai, self.refresh_all,
+                )
+            except Exception as exc:
+                messagebox.showerror("Erro ao importar PDF", str(exc))
+            return
 
-            if not expenses:
-                if messagebox.askyesno(
-                    "Sem resultados automáticos",
-                    "Nenhum gasto foi identificado automaticamente.\n"
-                    "Deseja enviar o texto do PDF para a IA tentar extrair os gastos?",
-                ):
-                    self._ask_ai_to_parse_pdf(raw_text)
-                return
+        # Múltiplos arquivos: importação em lote sem revisão individual
+        total_imported = 0
+        total_skipped = 0
+        erros = []
+        custom_cats = self.db.get_custom_categories()
 
-            # Mostra janela de revisão antes de salvar
-            _PDFReviewDialog(
-                self.root, expenses, raw_text, self.db,
-                self.db.get_custom_categories(), self.ai, self.refresh_all
-            )
+        for fp in sorted(file_paths):
+            try:
+                stem = Path(fp).stem.lower()
+                ano_match = re.search(r"20\d{2}", stem)
+                ref_year = int(ano_match.group()) if ano_match else dt.date.today().year
+                ref_month = _mes_do_nome(stem)
+                expenses, _ = parse_pdf_invoice(
+                    fp, custom_cats,
+                    reference_year=ref_year,
+                    reference_month=ref_month,
+                )
+                for exp in expenses:
+                    inst_num   = exp.get("installment_number", 1)
+                    inst_total = exp.get("installments", 1)
+                    if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card="PDF"):
+                        total_skipped += 1
+                        continue
+                    self.db.add_expense_raw(
+                        exp["date"], exp["description"], exp["amount"],
+                        exp["category"], card="PDF",
+                        installments=inst_total,
+                        installment_number=inst_num,
+                    )
+                    total_imported += 1
+            except Exception as exc:
+                erros.append(f"{Path(fp).name}: {exc}")
 
-        except Exception as exc:
-            messagebox.showerror("Erro ao importar PDF", str(exc))
+        self.refresh_all()
+        msg = f"Importação concluída em {len(file_paths)} faturas.\n\n✅ Importados: {total_imported}\n⏭ Duplicatas ignoradas: {total_skipped}"
+        if erros:
+            msg += "\n\n⚠️ Erros:\n" + "\n".join(erros)
+        messagebox.showinfo("Importação em lote", msg)
 
     def _ask_ai_to_parse_pdf(self, raw_text: str):
         self._set_ai_busy("Analisando PDF com IA...")
@@ -1423,8 +1570,7 @@ class CreditCardApp:
             confirm = messagebox.askyesno("Confirmação final", "Tem certeza absoluta? TODOS os dados serão perdidos.")
             if confirm:
                 self.db.delete_all()
-                self.refresh_all()
-                messagebox.showinfo("Dados apagados", "Todos os dados foram removidos.")
+                self._volta_para_login()
 
     # ------------------------------------------------------------------
     # Configurações
@@ -1626,8 +1772,7 @@ class CreditCardApp:
                 self.db.clear_expenses()
                 self.db.clear_goals()
                 self.db.clear_custom_categories()
-                self.refresh_all()
-                messagebox.showinfo("Manutenção", "Todos os dados do banco foram apagados.", parent=dlg)
+                self._volta_para_login()
 
         Button(tab_manut, text="🗑 Apagar TUDO (lançamentos + metas + categorias)",
                command=_apagar_tudo_manut,
@@ -1691,6 +1836,21 @@ class CreditCardApp:
     def on_close(self):
         self.db.close()
         self.root.destroy()
+
+    def _volta_para_login(self):
+        """Destrói a UI atual, fecha o banco e retorna à tela de login."""
+        self.db.close()
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        self.root.withdraw()
+        config = load_config()
+        if _do_login(self.root, config):
+            _apply_style(self.root)
+            new_app = CreditCardApp(self.root, config)
+            self.root.deiconify()
+            self.root.protocol("WM_DELETE_WINDOW", new_app.on_close)
+        else:
+            self.root.destroy()
 
 
 # ===========================================================================
@@ -1793,11 +1953,12 @@ class _PDFReviewDialog:
               font=FONT_SMALL, fg=CLR_MUTED).pack(anchor=W, padx=10)
 
         # Treeview de revisão
-        cols = ("date", "description", "amount", "category")
+        cols = ("date", "description", "amount", "category", "parcela")
         tree = ttk.Treeview(dlg, columns=cols, show="headings", height=16)
         for col, heading, width in [
-            ("date", "Data", 100), ("description", "Descrição", 380),
-            ("amount", "Valor", 100), ("category", "Categoria", 160),
+            ("date", "Data", 90), ("description", "Descrição", 330),
+            ("amount", "Valor", 100), ("category", "Categoria", 150),
+            ("parcela", "Parcela", 70),
         ]:
             tree.heading(col, text=heading)
             tree.column(col, width=width)
@@ -1805,9 +1966,10 @@ class _PDFReviewDialog:
         self.tree = tree
 
         for i, exp in enumerate(expenses):
+            parcela = f"{exp.get('installment_number', 1)}/{exp.get('installments', 1)}"
             tree.insert("", END, iid=str(i), values=(
                 exp["date"], exp["description"],
-                money(exp["amount"]), exp["category"],
+                money(exp["amount"]), exp["category"], parcela,
             ))
 
         tree.bind("<Double-1>", self._on_double_click)
@@ -1893,17 +2055,19 @@ class _PDFReviewDialog:
         imported = 0
         skipped = 0
         for exp in self.expenses:
+            inst_num   = exp.get("installment_number", 1)
+            inst_total = exp.get("installments", 1)
             if self.db.expense_exists(
-                exp["date"],
-                exp["description"],
-                exp["amount"],
-                card="PDF",
+                exp["date"], exp["description"], exp["amount"], card="PDF",
             ):
                 skipped += 1
                 continue
-            self.db.add_expense(
+            # Salva o lançamento bruto exatamente como aparece na fatura
+            self.db.add_expense_raw(
                 exp["date"], exp["description"], exp["amount"],
-                exp["category"], card="PDF", installments=1,
+                exp["category"], card="PDF",
+                installments=inst_total,
+                installment_number=inst_num,
             )
             imported += 1
         self.on_save()

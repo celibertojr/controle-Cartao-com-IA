@@ -196,6 +196,51 @@ def make_bar_chart(
 
 
 # ------------------------------------------------------------------
+# Gráfico de linhas — evolução gasto vs meta
+# ------------------------------------------------------------------
+
+def make_line_chart(
+    months: list[str],
+    gastos: list[float],
+    metas: list[float],
+    title: str,
+    figsize: tuple = (5.5, 3.2),
+):
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+
+    fig = plt.Figure(figsize=figsize, dpi=95)
+    ax = fig.add_subplot(111)
+
+    if months and gastos:
+        x = list(range(len(months)))
+        ax.plot(x, gastos, "o-", color=COLOR_PRIMARY, linewidth=2, markersize=5, label="Gasto")
+        ax.plot(x, metas,  "s--", color=COLOR_WARN,   linewidth=2, markersize=5, label="Meta")
+
+        # Destaca meses em que o gasto ultrapassou a meta
+        over_x = [xi for xi, g, m in zip(x, gastos, metas) if g > m]
+        over_g = [g  for g, m in zip(gastos, metas) if g > m]
+        if over_x:
+            ax.scatter(over_x, over_g, color=COLOR_DANGER, zorder=5, s=60)
+
+        ax.fill_between(x, gastos, metas,
+                        where=[g > m for g, m in zip(gastos, metas)],
+                        alpha=0.15, color=COLOR_DANGER)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(months, rotation=35, ha="right", fontsize=8)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: _br(v)))
+        ax.legend(fontsize=8, loc="upper left")
+    else:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center", fontsize=11)
+
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    return fig
+
+
+# ------------------------------------------------------------------
 # Gráfico horizontal de maiores gastos
 # ------------------------------------------------------------------
 
