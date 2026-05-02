@@ -5,6 +5,7 @@ Todas as queries ficam aqui — a GUI nunca acessa o banco diretamente.
 
 import sqlite3
 import datetime as dt
+import calendar
 import re
 from collections import defaultdict
 
@@ -12,12 +13,46 @@ from .utils import DB_PATH, add_months, invoice_month_for_date
 
 
 class Database:
-    def __init__(self, path=DB_PATH):
+    def __init__(self, path=DB_PATH, config: dict | None = None):
         self.path = path
+        self._config = config or {}
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")  # melhor concorrência
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.create_tables()
+
+    def set_config(self, config: dict):
+        """Atualiza referência ao config (chamar após salvar configurações)."""
+        self._config = config
+
+    def _closing_day(self, card: str | None) -> int:
+        """Retorna o dia de fechamento do cartão informado, ou o padrão."""
+        card_map = self._config.get("card_closing_days", {})
+        default = int(self._config.get("default_closing_day", 25))
+        if card and card in card_map:
+            return int(card_map[card])
+        return default
+
+    def _invoice_month(self, date_str: str, card: str | None) -> str:
+        """Calcula o mês da fatura (AAAA-MM) a partir da data e do cartão."""
+        d = dt.date.fromisoformat(date_str)
+        return invoice_month_for_date(d, self._closing_day(card))
+
+    def _expenses_for_month(self, month: str):
+        """
+        Retorna todos os lançamentos cujo invoice_month calculado é igual a `month`.
+        Usa filtro de datas no SQL para reduzir o volume antes de filtrar em Python.
+        """
+        year, m = int(month[:4]), int(month[5:7])
+        # Intervalo generoso: mês anterior completo até o fim do mês alvo
+        prev = dt.date(year, m, 1) - dt.timedelta(days=1)
+        broad_start = dt.date(prev.year, prev.month, 1).isoformat()
+        broad_end   = dt.date(year, m, calendar.monthrange(year, m)[1]).isoformat()
+        rows = self.conn.execute(
+            "SELECT * FROM expenses WHERE date >= ? AND date <= ? ORDER BY date DESC, id DESC",
+            (broad_start, broad_end),
+        ).fetchall()
+        return [r for r in rows if self._invoice_month(r["date"], r["card"]) == month]
 
     # ------------------------------------------------------------------
     # Criação de tabelas
@@ -37,8 +72,7 @@ class Database:
                 installment_number INTEGER DEFAULT 1,
                 parent_id          INTEGER,
                 notes              TEXT,
-                created_at         TEXT    NOT NULL,
-                invoice_month      TEXT
+                created_at         TEXT    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS monthly_goals (
@@ -51,15 +85,11 @@ class Database:
                 keywords TEXT NOT NULL
             );
         """)
-        # Migração: adiciona invoice_month se o banco já existia sem a coluna
+        # Remove coluna invoice_month de bancos antigos (não é mais necessária)
         try:
-            cur.execute("ALTER TABLE expenses ADD COLUMN invoice_month TEXT")
+            cur.execute("ALTER TABLE expenses DROP COLUMN invoice_month")
         except Exception:
-            pass  # coluna já existe
-        # Popula invoice_month para registros antigos (usa mês da data da transação)
-        cur.execute(
-            "UPDATE expenses SET invoice_month = substr(date, 1, 7) WHERE invoice_month IS NULL"
-        )
+            pass  # coluna já removida ou SQLite antigo sem suporte a DROP COLUMN
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -75,14 +105,12 @@ class Database:
         card: str = "",
         installments: int = 1,
         notes: str = "",
-        invoice_month: str | None = None,
     ):
-        """Adiciona gasto. Para parcelados, insere apenas a parcela atual (1/N); parcelas futuras são inferidas."""
+        """Adiciona gasto. Para parcelados, insere apenas a parcela 1/N."""
         installments = max(1, installments)
         monthly_value = round(amount / installments, 2) if installments > 1 else amount
-        inv = invoice_month or date[:7]
         self.add_expense_raw(date, description, monthly_value, category, card,
-                             installments, 1, inv, notes)
+                             installments, 1, notes)
 
     def edit_expense(
         self,
@@ -118,15 +146,10 @@ class Database:
     def list_expenses(self, month: str | None = None):
         """Lista gastos de uma fatura (AAAA-MM) ou todos os gastos."""
         if month:
-            cur = self.conn.execute(
-                "SELECT * FROM expenses WHERE invoice_month=? ORDER BY date DESC, id DESC",
-                (month,),
-            )
-        else:
-            cur = self.conn.execute(
-                "SELECT * FROM expenses ORDER BY invoice_month DESC, date DESC, id DESC"
-            )
-        return cur.fetchall()
+            return self._expenses_for_month(month)
+        return self.conn.execute(
+            "SELECT * FROM expenses ORDER BY date DESC, id DESC"
+        ).fetchall()
 
     def expense_exists(
         self,
@@ -168,21 +191,19 @@ class Database:
         card: str = "",
         installments: int = 1,
         installment_number: int = 1,
-        invoice_month: str | None = None,
         notes: str = "",
     ):
         """Insere um único lançamento sem expandir parcelas (usado na importação de PDF)."""
         created_at = dt.datetime.now().isoformat(timespec="seconds")
-        inv = invoice_month or date[:7]
         self.conn.execute(
             """
             INSERT INTO expenses
                 (date, description, amount, category, card,
-                 installments, installment_number, parent_id, notes, created_at, invoice_month)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                 installments, installment_number, parent_id, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """,
             (date, description, amount, category, card,
-             installments, installment_number, notes, created_at, inv),
+             installments, installment_number, notes, created_at),
         )
         self.conn.commit()
 
@@ -203,67 +224,69 @@ class Database:
     # ------------------------------------------------------------------
 
     def get_month_total(self, month: str) -> float:
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(amount),0) AS t FROM expenses WHERE invoice_month=?",
-            (month,),
-        ).fetchone()
-        return float(row["t"])
+        rows = self._expenses_for_month(month)
+        return round(sum(float(r["amount"]) for r in rows), 2)
 
     def get_category_totals(self, month: str):
-        return self.conn.execute(
-            """
-            SELECT category, COALESCE(SUM(amount),0) AS total
-            FROM expenses WHERE invoice_month=?
-            GROUP BY category ORDER BY total DESC
-            """,
-            (month,),
-        ).fetchall()
+        rows = self._expenses_for_month(month)
+        totals: dict[str, float] = defaultdict(float)
+        for r in rows:
+            totals[r["category"]] += float(r["amount"])
+        return sorted(
+            [{"category": cat, "total": round(t, 2)} for cat, t in totals.items()],
+            key=lambda x: -x["total"],
+        )
 
     def get_year_category_totals(self, year: int):
-        return self.conn.execute(
-            """
-            SELECT category, COALESCE(SUM(amount),0) AS total
-            FROM expenses WHERE substr(invoice_month,1,4)=?
-            GROUP BY category ORDER BY total DESC
-            """,
-            (str(year),),
-        ).fetchall()
+        rows = self.conn.execute("SELECT date, card, category, amount FROM expenses").fetchall()
+        totals: dict[str, float] = defaultdict(float)
+        for r in rows:
+            if self._invoice_month(r["date"], r["card"])[:4] == str(year):
+                totals[r["category"]] += float(r["amount"])
+        return sorted(
+            [{"category": cat, "total": round(t, 2)} for cat, t in totals.items()],
+            key=lambda x: -x["total"],
+        )
 
     def get_all_month_totals(self):
-        """Totais agrupados por fatura (invoice_month), ordenados cronologicamente."""
-        return self.conn.execute(
-            """
-            SELECT invoice_month AS month, COALESCE(SUM(amount),0) AS total
-            FROM expenses GROUP BY invoice_month ORDER BY invoice_month ASC
-            """
-        ).fetchall()
+        """Totais agrupados por fatura calculada, ordenados cronologicamente."""
+        rows = self.conn.execute("SELECT date, card, amount FROM expenses").fetchall()
+        totals: dict[str, float] = defaultdict(float)
+        for r in rows:
+            inv = self._invoice_month(r["date"], r["card"])
+            totals[inv] += float(r["amount"])
+        return [
+            {"month": m, "total": round(t, 2)}
+            for m, t in sorted(totals.items())
+        ]
 
     def get_year_totals(self):
-        return self.conn.execute(
-            """
-            SELECT substr(invoice_month,1,4) AS year, COALESCE(SUM(amount),0) AS total
-            FROM expenses GROUP BY substr(invoice_month,1,4) ORDER BY year ASC
-            """
-        ).fetchall()
+        rows = self.conn.execute("SELECT date, card, amount FROM expenses").fetchall()
+        totals: dict[str, float] = defaultdict(float)
+        for r in rows:
+            year = self._invoice_month(r["date"], r["card"])[:4]
+            totals[year] += float(r["amount"])
+        return [
+            {"year": y, "total": round(t, 2)}
+            for y, t in sorted(totals.items())
+        ]
 
     def get_future_commitments(self, start_month: str, months_ahead: int = 12):
         """
-        Calcula comprometimentos futuros usando invoice_month como unidade.
-        Infere parcelas restantes sem duplicar entradas já registradas.
-        Retorna lista de dicts {"month": "AAAA-MM", "total": float}.
+        Calcula comprometimentos futuros inferindo parcelas restantes.
+        invoice_month é calculado dinamicamente a partir de date + card.
         """
         all_rows = self.conn.execute(
-            "SELECT description, amount, installments, installment_number, invoice_month "
-            "FROM expenses ORDER BY invoice_month ASC"
+            "SELECT description, amount, installments, installment_number, date, card "
+            "FROM expenses ORDER BY date ASC"
         ).fetchall()
 
-        # Chave (desc_lower, total_parc, num_parc, invoice_month)
         recorded: set[tuple] = {
             (
                 (r["description"] or "").strip().lower(),
                 r["installments"] or 1,
                 r["installment_number"] or 1,
-                r["invoice_month"] or "",
+                self._invoice_month(r["date"], r["card"]),
             )
             for r in all_rows
         }
@@ -271,10 +294,10 @@ class Database:
         totals: dict[str, float] = defaultdict(float)
 
         for row in all_rows:
-            inv = row["invoice_month"] or ""
+            inv = self._invoice_month(row["date"], row["card"])
             totals[inv] += float(row["amount"])
 
-            n_total = row["installments"] or 1
+            n_total   = row["installments"] or 1
             n_current = row["installment_number"] or 1
             remaining = n_total - n_current
             if remaining <= 0:
@@ -283,19 +306,18 @@ class Database:
             desc_lower = (row["description"] or "").strip().lower()
             base = dt.datetime.strptime(inv + "-01", "%Y-%m-%d").date()
 
-            # Não projeta se o próximo da cadeia já está registrado
             next_inv = add_months(base, 1).strftime("%Y-%m")
             if (desc_lower, n_total, n_current + 1, next_inv) in recorded:
                 continue
 
             for offset in range(1, remaining + 1):
-                future_inv = add_months(base, offset).strftime("%Y-%m")
+                future_inv      = add_months(base, offset).strftime("%Y-%m")
                 future_inst_num = n_current + offset
                 if (desc_lower, n_total, future_inst_num, future_inv) not in recorded:
                     totals[future_inv] += float(row["amount"])
 
         result = sorted(
-            [{"month": m, "total": t} for m, t in totals.items() if m >= start_month],
+            [{"month": m, "total": round(t, 2)} for m, t in totals.items() if m >= start_month],
             key=lambda x: x["month"],
         )
         return result[:months_ahead]
@@ -352,21 +374,17 @@ class Database:
 
     def get_top_expenses(self, month: str | None = None, limit: int = 8):
         if month:
-            return self.conn.execute(
-                "SELECT * FROM expenses WHERE invoice_month=? ORDER BY amount DESC LIMIT ?",
-                (month, limit),
-            ).fetchall()
+            rows = self._expenses_for_month(month)
+            rows = sorted(rows, key=lambda r: -float(r["amount"]))
+            return rows[:limit]
         return self.conn.execute(
             "SELECT * FROM expenses ORDER BY amount DESC LIMIT ?", (limit,)
         ).fetchall()
 
     def count_expenses(self, month: str | None = None) -> int:
         if month:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM expenses WHERE invoice_month=?", (month,)
-            ).fetchone()
-        else:
-            row = self.conn.execute("SELECT COUNT(*) AS n FROM expenses").fetchone()
+            return len(self._expenses_for_month(month))
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM expenses").fetchone()
         return int(row["n"])
 
     # ------------------------------------------------------------------
@@ -384,11 +402,6 @@ class Database:
         self.conn.commit()
 
     def get_goal(self, month: str, default_goal: float) -> float:
-        """
-        Retorna a meta do mês informado.
-        Se houver meta salva para o mês, ela prevalece.
-        Caso contrário, usa a meta atual padrão informada pela interface.
-        """
         row = self.conn.execute(
             "SELECT goal FROM monthly_goals WHERE month=?", (month,)
         ).fetchone()

@@ -7,6 +7,9 @@ import hashlib
 import datetime as dt
 from pathlib import Path
 
+# Raiz do repositório (dois níveis acima de app/)
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+
 # Diretório de dados do usuário (fora do repositório)
 APP_DIR = Path.home() / ".controle_cartao_ia"
 APP_DIR.mkdir(exist_ok=True)
@@ -200,6 +203,25 @@ def month_db_to_br(month_db: str) -> str:
         return dt.datetime.strptime(month_db, "%Y-%m").strftime("%m/%Y")
     except ValueError:
         return month_db
+
+
+def date_db_to_br(date_db: str) -> str:
+    """Converte AAAA-MM-DD → DD/MM/AAAA."""
+    try:
+        return dt.datetime.strptime(date_db, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return date_db
+
+
+def date_br_to_db(date_br: str) -> str:
+    """Converte DD/MM/AAAA → AAAA-MM-DD."""
+    date_br = date_br.strip()
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+        try:
+            return dt.datetime.strptime(date_br, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError("Informe a data no formato DD/MM/AAAA. Exemplo: 26/04/2026")
 
 
 # ---------------------------------------------------------------------------

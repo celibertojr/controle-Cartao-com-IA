@@ -22,14 +22,16 @@ from .utils import (
     load_config, save_config, hash_password, check_password,
     generate_recovery_key,
     add_months, current_month, month_br_to_db, month_db_to_br,
+    date_db_to_br, date_br_to_db,
     classify_expense, get_all_category_names, money, parse_money,
     current_year, DB_PATH, BACKUP_DIR,
-    invoice_month_for_date, invoice_period,
+    invoice_period,
 )
 from .database import Database
 from .ai_advisor import AIAdvisor
 from .pdf_importer import parse_pdf_invoice, extract_raw_text, PDFPLUMBER_AVAILABLE
 from . import charts
+from .updater import local_commit_date
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +495,10 @@ class CreditCardApp:
     def __init__(self, root: Tk, config: dict):
         self.root = root
         self.config = config
-        self.db = Database()
+        self.db = Database(config=config)
         self.ai = AIAdvisor(config)
         self._ai_thread: threading.Thread | None = None
+        self._local_version = local_commit_date()  # calculado uma vez ao iniciar
 
         self.month_var = StringVar(value=current_month())
         self.goal_var  = DoubleVar(value=float(config.get("monthly_goal", 3000.00)))
@@ -587,8 +590,6 @@ class CreditCardApp:
             ("⚙ Configurações", self.open_settings),
             ("🏷 Categorias", self.open_category_manager),
             ("📊 Exportar Excel", self.export_to_excel),
-            ("💾 Backup", self.backup_db),
-            ("♻ Restaurar", self.restore_db),
         ]:
             Button(right, text=label, command=cmd,
                    bg=CLR_PRIMARY, fg="white", relief="flat",
@@ -683,7 +684,7 @@ class CreditCardApp:
         row1 = Frame(form_frame, bg=CLR_CARD)
         row1.pack(fill=X)
 
-        self.f_date  = self._form_entry(row1, "Data (AAAA-MM-DD)", dt.date.today().strftime("%Y-%m-%d"), 12)
+        self.f_date  = self._form_entry(row1, "Data (DD/MM/AAAA)", dt.date.today().strftime("%d/%m/%Y"), 12)
         self.f_desc  = self._form_entry(row1, "Descrição", "", 38)
         self.f_value = self._form_entry(row1, "Valor (R$)", "", 12)
 
@@ -1036,7 +1037,7 @@ class CreditCardApp:
             # Rótulo: data + descrição + categoria em duas linhas
             default_goal = self.config.get("monthly_goal", 3000.0)
             t_labels = [
-                f"{r['date'][5:]}  {r['description'][:22]}\n{r['category'][:18]}"
+                f"{date_db_to_br(r['date'])[:5]}  {r['description'][:22]}\n{r['category'][:18]}"
                 for r in top_rows
             ]
             t_values = [float(r["amount"]) for r in top_rows]
@@ -1087,7 +1088,7 @@ class CreditCardApp:
             parcela = f"{row['installment_number']}/{row['installments']}"
             self.expense_tree.insert("", END, iid=str(row["id"]), values=(
                 row["id"],
-                row["date"],
+                date_db_to_br(row["date"]),
                 row["description"],
                 money(row["amount"]),
                 row["category"],
@@ -1153,7 +1154,7 @@ class CreditCardApp:
             for row in rows:
                 parcela = f"{row['installment_number']}/{row['installments']}"
                 self.future_detail_tree.insert("", END, values=(
-                    row["date"],
+                    date_db_to_br(row["date"]),
                     row["description"],
                     money(row["amount"]),
                     row["category"],
@@ -1170,8 +1171,7 @@ class CreditCardApp:
 
     def add_manual_expense(self):
         try:
-            date         = self.f_date.get().strip()
-            dt.datetime.strptime(date, "%Y-%m-%d")
+            date         = date_br_to_db(self.f_date.get().strip())
             description  = self.f_desc.get().strip()
             amount       = parse_money(self.f_value.get())
             category     = self.f_cat_var.get().strip() or classify_expense(description, self.db.get_custom_categories())
@@ -1186,13 +1186,8 @@ class CreditCardApp:
             if installments < 1:
                 raise ValueError("Número de parcelas inválido.")
 
-            closing = self.config.get("card_closing_days", {}).get(
-                card, self.config.get("default_closing_day", 25)
-            )
-            exp_date  = dt.date.fromisoformat(date)
-            inv_month = invoice_month_for_date(exp_date, closing)
             self.db.add_expense(date, description, amount, category, card,
-                                installments, notes, invoice_month=inv_month)
+                                installments, notes)
 
             # limpa só os campos de valor e descrição
             self.f_desc.delete(0, END)
@@ -1347,14 +1342,11 @@ class CreditCardApp:
                     if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card=card):
                         total_skipped += 1
                         continue
-                    exp_date = dt.date.fromisoformat(exp["date"])
-                    inv_month = invoice_month_for_date(exp_date, closing_day)
                     self.db.add_expense_raw(
                         exp["date"], exp["description"], exp["amount"],
                         exp["category"], card=card,
                         installments=inst_total,
                         installment_number=inst_num,
-                        invoice_month=inv_month,
                     )
                     total_imported += 1
             except Exception as exc:
@@ -1548,7 +1540,7 @@ class CreditCardApp:
 
         lines.append(f"\nMaiores gastos do mês ({month_br}):")
         for r in top_rows:
-            lines.append(f"  {r['date']} | {r['description']} | {r['category']} | {money(r['amount'])}")
+            lines.append(f"  {date_db_to_br(r['date'])} | {r['description']} | {r['category']} | {money(r['amount'])}")
 
         return "\n".join(lines)
 
@@ -1597,7 +1589,7 @@ class CreditCardApp:
         for r in rows:
             data.append({
                 "ID":           r["id"],
-                "Data":         r["date"],
+                "Data":         date_db_to_br(r["date"]),
                 "Descrição":    r["description"],
                 "Valor (R$)":   round(float(r["amount"]), 2),
                 "Categoria":    r["category"],
@@ -1646,7 +1638,7 @@ class CreditCardApp:
         if messagebox.askyesno("Restaurar", "Isso substituirá o banco de dados atual. Continuar?"):
             self.db.close()
             shutil.copy2(path, DB_PATH)
-            self.db = Database()
+            self.db = Database(config=self.config)
             self.refresh_all()
             messagebox.showinfo("Restaurar", "Backup restaurado com sucesso.")
 
@@ -1680,9 +1672,13 @@ class CreditCardApp:
 
         tab_ai = Frame(notebook, bg=CLR_CARD)
         tab_user = Frame(notebook, bg=CLR_CARD)
+        tab_backup = Frame(notebook, bg=CLR_CARD)
+        tab_update = Frame(notebook, bg=CLR_CARD)
         tab_manut = Frame(notebook, bg=CLR_CARD)
         notebook.add(tab_ai, text="  IA  ")
         notebook.add(tab_user, text="  Usuário  ")
+        notebook.add(tab_backup, text="  Backup  ")
+        notebook.add(tab_update, text="  Atualização  ")
         notebook.add(tab_manut, text="  Manutenção  ")
 
         ai_vars = {}
@@ -1868,6 +1864,138 @@ class CreditCardApp:
                bg=CLR_DANGER, fg="white", relief="flat",
                font=FONT_SMALL, padx=12, pady=5).pack(anchor=W, padx=14)
 
+        # --- aba Backup ---
+        Label(tab_backup, text="Backup e Restauração", font=FONT_HEADER,
+              bg=CLR_CARD, fg=CLR_TEXT).pack(anchor=W, padx=14, pady=(12, 2))
+        Label(
+            tab_backup,
+            text="O backup salva uma cópia do banco de dados local.\nRestaurar substitui os dados atuais pelo backup selecionado.",
+            justify=LEFT, font=FONT_SMALL, fg=CLR_MUTED,
+            bg=CLR_LIGHT, padx=10, pady=8,
+        ).pack(fill=X, padx=14, pady=(0, 16))
+
+        def _fazer_backup():
+            ts   = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = BACKUP_DIR / f"cartao_backup_{ts}.db"
+            shutil.copy2(DB_PATH, dest)
+            _write_backup_metadata(dest, self.config, "backup_manual")
+            messagebox.showinfo("Backup", f"Backup criado em:\n{dest}", parent=dlg)
+
+        def _restaurar_backup():
+            path = filedialog.askopenfilename(
+                title="Selecione um backup .db",
+                initialdir=BACKUP_DIR,
+                filetypes=[("SQLite DB", "*.db"), ("Todos", "*.*")],
+                parent=dlg,
+            )
+            if not path:
+                return
+            if messagebox.askyesno(
+                "Restaurar",
+                "Isso substituirá o banco de dados atual. Continuar?",
+                parent=dlg,
+            ):
+                self.db.close()
+                shutil.copy2(path, DB_PATH)
+                self.db = Database(config=self.config)
+                self.refresh_all()
+                dlg.destroy()
+                messagebox.showinfo("Restaurar", "Backup restaurado com sucesso.", parent=self.root)
+
+        row_backup = Frame(tab_backup, bg=CLR_CARD)
+        row_backup.pack(anchor=W, padx=14, pady=4)
+        Button(row_backup, text="💾  Fazer backup agora", command=_fazer_backup,
+               bg=CLR_OK, fg="white", relief="flat",
+               font=FONT_NORMAL, padx=14, pady=6).pack(side=LEFT, padx=(0, 12))
+        Button(row_backup, text="♻  Restaurar backup", command=_restaurar_backup,
+               bg=CLR_ACCENT, fg="white", relief="flat",
+               font=FONT_NORMAL, padx=14, pady=6).pack(side=LEFT)
+
+        Label(tab_backup, text=f"Local dos backups:\n{BACKUP_DIR}",
+              font=FONT_SMALL, fg=CLR_MUTED, bg=CLR_CARD,
+              justify=LEFT).pack(anchor=W, padx=14, pady=(16, 4))
+
+        # --- aba Atualização ---
+        from .updater import check_update, apply_update, restart_app
+
+        Label(tab_update, text="Atualização do sistema", font=FONT_HEADER,
+              bg=CLR_CARD, fg=CLR_TEXT).pack(anchor=W, padx=14, pady=(12, 2))
+
+        Label(tab_update, text=f"Versão instalada: {date_db_to_br(self._local_version)}",
+              font=FONT_SMALL, fg=CLR_MUTED, bg=CLR_CARD).pack(anchor=W, padx=14, pady=(0, 12))
+
+        status_var  = StringVar(value="")
+        btn_update_var = {"btn": None}   # referência ao botão "Atualizar"
+
+        status_lbl = Label(tab_update, textvariable=status_var,
+                           font=FONT_SMALL, fg=CLR_TEXT, bg=CLR_LIGHT,
+                           justify=LEFT, padx=10, pady=8, wraplength=540)
+        status_lbl.pack(fill=X, padx=14, pady=(0, 10))
+        status_lbl.pack_forget()  # oculto até haver resultado
+
+        def _show_status(msg: str, color: str = CLR_TEXT):
+            status_var.set(msg)
+            status_lbl.configure(fg=color)
+            status_lbl.pack(fill=X, padx=14, pady=(0, 10))
+
+        def _do_check():
+            _show_status("Verificando atualizações…", CLR_MUTED)
+            if btn_update_var["btn"]:
+                btn_update_var["btn"].pack_forget()
+
+            def _run():
+                info = check_update()
+                if info["error"]:
+                    tab_update.after(0, lambda: _show_status(
+                        f"Erro ao verificar: {info['error']}", CLR_DANGER))
+                    return
+                if not info["has_update"]:
+                    tab_update.after(0, lambda: _show_status(
+                        "Você já está na versão mais recente.", CLR_OK))
+                    return
+                msg = (
+                    f"Nova versão disponível!\n"
+                    f"Data: {date_db_to_br(info['remote_date'])}\n"
+                    f"Commit: {info['remote_message']}"
+                )
+                tab_update.after(0, lambda: _show_status(msg, CLR_ACCENT))
+                tab_update.after(0, _show_update_btn)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _show_update_btn():
+            if btn_update_var["btn"]:
+                btn_update_var["btn"].pack_forget()
+            btn = Button(tab_update, text="⬆  Atualizar e reiniciar",
+                         command=_do_update,
+                         bg=CLR_ACCENT, fg="white", relief="flat",
+                         font=FONT_NORMAL, padx=14, pady=6)
+            btn.pack(anchor=W, padx=14, pady=4)
+            btn_update_var["btn"] = btn
+
+        def _do_update():
+            _show_status("Aplicando atualização…", CLR_MUTED)
+            if btn_update_var["btn"]:
+                btn_update_var["btn"].configure(state="disabled")
+
+            def _run():
+                ok, msg = apply_update()
+                if not ok:
+                    tab_update.after(0, lambda: _show_status(
+                        f"Falha na atualização:\n{msg}", CLR_DANGER))
+                    if btn_update_var["btn"]:
+                        tab_update.after(0, lambda: btn_update_var["btn"].configure(state="normal"))
+                    return
+                tab_update.after(0, lambda: _show_status(
+                    "Atualização aplicada! Reiniciando…", CLR_OK))
+                tab_update.after(1500, restart_app)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        Button(tab_update, text="🔍  Verificar atualizações", command=_do_check,
+               bg=CLR_PRIMARY, fg="white", relief="flat",
+               font=FONT_NORMAL, padx=14, pady=6).pack(anchor=W, padx=14, pady=(0, 8))
+
         btn_frame = Frame(dlg, bg=CLR_BG)
         btn_frame.pack(fill=X, padx=14, pady=(0, 12))
 
@@ -1902,6 +2030,7 @@ class CreditCardApp:
 
             save_config(self.config)
             self.ai = AIAdvisor(self.config)
+            self.db.set_config(self.config)
             dlg.destroy()
 
             if generated_key:
@@ -1961,7 +2090,7 @@ class _EditExpenseDialog:
         pad = {"padx": 14, "pady": 4}
         Label(dlg, text="Editar lançamento", font=FONT_HEADER).pack(anchor=W, **pad)
 
-        self.v_date  = StringVar(value=row["date"])
+        self.v_date  = StringVar(value=date_db_to_br(row["date"]))
         self.v_desc  = StringVar(value=row["description"])
         self.v_amt   = StringVar(value=f"{row['amount']:.2f}")
         self.v_cat   = StringVar(value=row["category"])
@@ -1969,7 +2098,7 @@ class _EditExpenseDialog:
         self.v_notes = StringVar(value=row["notes"] or "")
 
         fields = [
-            ("Data (AAAA-MM-DD):", self.v_date),
+            ("Data (DD/MM/AAAA):", self.v_date),
             ("Descrição:",         self.v_desc),
             ("Valor (R$):",        self.v_amt),
             ("Cartão:",            self.v_card),
@@ -1993,8 +2122,7 @@ class _EditExpenseDialog:
 
     def _save(self):
         try:
-            date  = self.v_date.get().strip()
-            dt.datetime.strptime(date, "%Y-%m-%d")
+            date  = date_br_to_db(self.v_date.get().strip())
             desc  = self.v_desc.get().strip()
             amt   = parse_money(self.v_amt.get())
             cat   = self.v_cat.get().strip()
@@ -2064,7 +2192,7 @@ class _PDFReviewDialog:
         for i, exp in enumerate(expenses):
             parcela = f"{exp.get('installment_number', 1)}/{exp.get('installments', 1)}"
             tree.insert("", END, iid=str(i), values=(
-                exp["date"], exp["description"],
+                date_db_to_br(exp["date"]), exp["description"],
                 money(exp["amount"]), exp["category"], parcela,
             ))
 
@@ -2096,7 +2224,7 @@ class _PDFReviewDialog:
         dlg2.grab_set()
 
         vars_ = {
-            "date":        StringVar(value=exp["date"]),
+            "date":        StringVar(value=date_db_to_br(exp["date"])),
             "description": StringVar(value=exp["description"]),
             "amount":      StringVar(value=f"{exp['amount']:.2f}"),
             "category":    StringVar(value=exp["category"]),
@@ -2111,12 +2239,12 @@ class _PDFReviewDialog:
 
         def apply():
             try:
-                exp["date"]        = vars_["date"].get().strip()
+                exp["date"]        = date_br_to_db(vars_["date"].get().strip())
                 exp["description"] = vars_["description"].get().strip()
                 exp["amount"]      = parse_money(vars_["amount"].get())
                 exp["category"]    = vars_["category"].get().strip()
                 self.tree.item(str(idx), values=(
-                    exp["date"], exp["description"],
+                    date_db_to_br(exp["date"]), exp["description"],
                     money(exp["amount"]), exp["category"],
                 ))
                 dlg2.destroy()
@@ -2158,14 +2286,11 @@ class _PDFReviewDialog:
             ):
                 skipped += 1
                 continue
-            exp_date  = dt.date.fromisoformat(exp["date"])
-            inv_month = invoice_month_for_date(exp_date, self.closing_day)
             self.db.add_expense_raw(
                 exp["date"], exp["description"], exp["amount"],
                 exp["category"], card=self.card,
                 installments=inst_total,
                 installment_number=inst_num,
-                invoice_month=inv_month,
             )
             imported += 1
         self.on_save()
