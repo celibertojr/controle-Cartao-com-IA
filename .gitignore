@@ -7,6 +7,9 @@ backups/
 # Arquivo de status da sessão de trabalho (nunca vai ao git)
 STATUS.md
 
+# Faturas e arquivos de teste locais
+faturas_teste/
+
 # Python
 __pycache__/
 *.py[cod]
