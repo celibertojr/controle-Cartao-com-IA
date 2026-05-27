@@ -7,8 +7,10 @@ backups/
 # Arquivo de status da sessão de trabalho (nunca vai ao git)
 STATUS.md
 
-# Faturas e arquivos de teste locais
+# Faturas — dados pessoais, NUNCA vão ao git
+faturas/
 faturas_teste/
+*.pdf
 
 # Python
 __pycache__/
