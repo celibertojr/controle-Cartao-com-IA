@@ -24,7 +24,7 @@ from .utils import (
     add_months, current_month, month_br_to_db, month_db_to_br,
     date_db_to_br, date_br_to_db,
     classify_expense, get_all_category_names, money, parse_money,
-    current_year, DB_PATH, BACKUP_DIR,
+    current_year, DB_PATH, BACKUP_DIR, PROJECT_ROOT,
     invoice_period,
 )
 from .database import Database
@@ -716,6 +716,8 @@ class CreditCardApp:
         tree_toolbar.pack(fill=X, pady=(0, 4))
         Button(tree_toolbar, text="📄 Importar fatura PDF", command=self.import_pdf,
                relief="flat", bg=CLR_ACCENT, fg="white", font=FONT_SMALL, padx=8).pack(side=LEFT, padx=(0, 6))
+        Button(tree_toolbar, text="📂 Carregar faturas", command=self.load_faturas_dir,
+               relief="flat", bg=CLR_OK, fg="white", font=FONT_SMALL, padx=8).pack(side=LEFT, padx=(0, 6))
         Button(tree_toolbar, text="✏ Editar selecionado", command=self.edit_selected_expense,
                relief="flat", bg=CLR_WARN, fg="white", font=FONT_SMALL, padx=8).pack(side=LEFT, padx=(0, 6))
         Button(tree_toolbar, text="🗑 Excluir selecionado", command=self.delete_selected_expense,
@@ -1357,6 +1359,82 @@ class CreditCardApp:
         if erros:
             msg += "\n\n⚠️ Erros:\n" + "\n".join(erros)
         messagebox.showinfo("Importação em lote", msg)
+
+    def load_faturas_dir(self):
+        """Carrega todos os PDFs do diretório faturas/ de uma vez."""
+        if not PDFPLUMBER_AVAILABLE:
+            messagebox.showerror("Dependência ausente",
+                                 "Instale pdfplumber para importar PDFs:\npip install pdfplumber")
+            return
+
+        faturas_dir = PROJECT_ROOT / "faturas"
+        faturas_dir.mkdir(exist_ok=True)
+
+        pdfs = sorted(faturas_dir.glob("*.pdf"))
+
+        if not pdfs:
+            messagebox.showinfo(
+                "Nenhuma fatura encontrada",
+                f"Nenhum arquivo PDF encontrado em:\n{faturas_dir}\n\n"
+                "Coloque os PDFs das faturas nessa pasta e clique novamente.",
+            )
+            return
+
+        # Confirma com o usuário antes de processar
+        nomes = "\n".join(f"  • {p.name}" for p in pdfs)
+        if not messagebox.askyesno(
+            "Carregar faturas",
+            f"Foram encontrados {len(pdfs)} arquivo(s):\n\n{nomes}\n\n"
+            "Deseja importar todos agora?",
+        ):
+            return
+
+        # Pergunta cartão e dia de fechamento (usa o primeiro PDF como referência de nome)
+        card_hint = re.sub(r"[_\-\d]", " ", pdfs[0].stem).strip()
+        card, closing_day = _ask_closing_day(self.root, self.config, card_hint)
+        if card is None:
+            return
+
+        # Importação em lote
+        total_imported = 0
+        total_skipped  = 0
+        erros: list[str] = []
+        custom_cats = self.db.get_custom_categories()
+
+        for pdf_path in pdfs:
+            try:
+                stem = pdf_path.stem.lower()
+                ano_match = re.search(r"20\d{2}", stem)
+                ref_year  = int(ano_match.group()) if ano_match else dt.date.today().year
+                ref_month = _mes_do_nome(stem)
+                expenses, _ = parse_pdf_invoice(
+                    str(pdf_path), custom_cats,
+                    reference_year=ref_year,
+                    reference_month=ref_month,
+                )
+                for exp in expenses:
+                    if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card=card):
+                        total_skipped += 1
+                        continue
+                    self.db.add_expense_raw(
+                        exp["date"], exp["description"], exp["amount"],
+                        exp["category"], card=card,
+                        installments=exp.get("installments", 1),
+                        installment_number=exp.get("installment_number", 1),
+                    )
+                    total_imported += 1
+            except Exception as exc:
+                erros.append(f"{pdf_path.name}: {exc}")
+
+        self.refresh_all()
+        msg = (
+            f"Importação concluída — {len(pdfs)} fatura(s) processada(s).\n\n"
+            f"✅ Importados: {total_imported}\n"
+            f"⏭ Duplicatas ignoradas: {total_skipped}"
+        )
+        if erros:
+            msg += "\n\n⚠️ Erros:\n" + "\n".join(erros)
+        messagebox.showinfo("Carregar faturas", msg)
 
     def _ask_ai_to_parse_pdf(self, raw_text: str):
         self._set_ai_busy("Analisando PDF com IA...")
