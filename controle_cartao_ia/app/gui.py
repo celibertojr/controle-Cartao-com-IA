@@ -29,7 +29,7 @@ from .utils import (
 )
 from .database import Database
 from .ai_advisor import AIAdvisor
-from .pdf_importer import parse_pdf_invoice, extract_raw_text, PDFPLUMBER_AVAILABLE
+from .pdf_importer import parse_pdf_invoice, extract_raw_text, extract_invoice_metadata, PDFPLUMBER_AVAILABLE
 from . import charts
 from .updater import local_commit_date
 
@@ -541,16 +541,19 @@ class CreditCardApp:
         self.tab_dash    = Frame(self.notebook, bg=CLR_BG)
         self.tab_exp     = Frame(self.notebook, bg=CLR_BG)
         self.tab_future  = Frame(self.notebook, bg=CLR_BG)
+        self.tab_faturas = Frame(self.notebook, bg=CLR_BG)
         self.tab_ai      = Frame(self.notebook, bg=CLR_BG)
 
-        self.notebook.add(self.tab_dash,   text="  Dashboard  ")
-        self.notebook.add(self.tab_exp,    text="  Gastos  ")
-        self.notebook.add(self.tab_future, text="  Próximos meses  ")
-        self.notebook.add(self.tab_ai,     text="  Análise IA  ")
+        self.notebook.add(self.tab_dash,    text="  Dashboard  ")
+        self.notebook.add(self.tab_exp,     text="  Gastos  ")
+        self.notebook.add(self.tab_future,  text="  Próximos meses  ")
+        self.notebook.add(self.tab_faturas, text="  Faturas  ")
+        self.notebook.add(self.tab_ai,      text="  Análise IA  ")
 
         self._build_dashboard_tab()
         self._build_expenses_tab()
         self._build_future_tab()
+        self._build_faturas_tab()
         self._build_ai_tab()
         self._build_ai_sidebar(right_frame)
 
@@ -849,6 +852,264 @@ class CreditCardApp:
         self.future_detail_tree.configure(yscrollcommand=vsb_d.set)
         self.future_detail_tree.pack(side=LEFT, fill=BOTH, expand=True)
         vsb_d.pack(side=RIGHT, fill=Y)
+
+    # ------------------------------------------------------------------
+    # Tab Faturas
+    # ------------------------------------------------------------------
+
+    def _build_faturas_tab(self):
+        """Aba que lista os PDFs em faturas/ e mostra detalhes ao clicar."""
+        parent = self.tab_faturas
+
+        # Cabeçalho
+        hdr = Frame(parent, bg=CLR_PRIMARY, height=36)
+        hdr.pack(fill=X)
+        hdr.pack_propagate(False)
+        Label(hdr, text="Faturas disponíveis em faturas/",
+              font=FONT_HEADER, bg=CLR_PRIMARY, fg="white").pack(side=LEFT, padx=12, pady=6)
+        Button(hdr, text="🔄 Atualizar lista", command=self._refresh_faturas_list,
+               relief="flat", bg=CLR_ACCENT, fg="white", font=FONT_SMALL, padx=8
+               ).pack(side=RIGHT, padx=8, pady=4)
+
+        # Corpo: lista à esquerda, detalhes à direita
+        body = Frame(parent, bg=CLR_BG)
+        body.pack(fill=BOTH, expand=True, padx=8, pady=6)
+
+        # --- Painel esquerdo: lista de arquivos ---
+        left = Frame(body, bg=CLR_CARD, relief="solid", bd=1, width=260)
+        left.pack(side=LEFT, fill=Y, padx=(0, 6))
+        left.pack_propagate(False)
+
+        Label(left, text="Arquivos PDF", font=FONT_SMALL, bg=CLR_CARD,
+              fg=CLR_MUTED).pack(anchor=W, padx=8, pady=(6, 2))
+
+        lb_frame = Frame(left, bg=CLR_CARD)
+        lb_frame.pack(fill=BOTH, expand=True, padx=4, pady=(0, 4))
+
+        from tkinter import Listbox, SINGLE
+        sb = ttk.Scrollbar(lb_frame, orient="vertical")
+        self._fatura_listbox = Listbox(
+            lb_frame, font=FONT_SMALL, selectbackground=CLR_ACCENT,
+            selectforeground="white", bg=CLR_CARD, relief="flat",
+            yscrollcommand=sb.set, selectmode=SINGLE, activestyle="none",
+        )
+        sb.config(command=self._fatura_listbox.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self._fatura_listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        self._fatura_listbox.bind("<<ListboxSelect>>", self._on_fatura_select)
+
+        # --- Painel direito: detalhes ---
+        right = Frame(body, bg=CLR_BG)
+        right.pack(side=LEFT, fill=BOTH, expand=True)
+
+        # Cabeçalho dos detalhes
+        self._fatura_detail_hdr = Frame(right, bg=CLR_CARD, relief="solid", bd=1)
+        self._fatura_detail_hdr.pack(fill=X, pady=(0, 6))
+
+        self._fatura_meta_labels: dict = {}
+        meta_fields = [
+            ("arquivo",  "Arquivo"),
+            ("banco",    "Banco"),
+            ("total",    "Total da fatura"),
+            ("venc",     "Vencimento"),
+            ("fecha",    "Prev. fechamento próxima"),
+            ("minimo",   "Pagamento mínimo"),
+            ("limite",   "Limite de compras"),
+            ("lanctos",  "Lançamentos encontrados"),
+        ]
+        grid = Frame(self._fatura_detail_hdr, bg=CLR_CARD)
+        grid.pack(fill=X, padx=12, pady=8)
+        for i, (key, label) in enumerate(meta_fields):
+            col, row = (0, i) if i < 4 else (2, i - 4)
+            Label(grid, text=f"{label}:", font=FONT_SMALL, bg=CLR_CARD,
+                  fg=CLR_MUTED, anchor=W).grid(row=row, column=col, sticky=W, padx=(8 if col else 0, 4), pady=2)
+            var = StringVar(value="—")
+            self._fatura_meta_labels[key] = var
+            Label(grid, textvariable=var, font=(FONT_SMALL[0], FONT_SMALL[1], "bold"),
+                  bg=CLR_CARD, fg=CLR_TEXT, anchor=W).grid(row=row, column=col + 1, sticky=W, padx=(0, 24), pady=2)
+
+        # Botões de ação
+        btn_frame = Frame(self._fatura_detail_hdr, bg=CLR_CARD)
+        btn_frame.pack(fill=X, padx=12, pady=(0, 8))
+        Button(btn_frame, text="📥 Importar esta fatura", command=self._import_selected_fatura,
+               relief="flat", bg=CLR_OK, fg="white", font=FONT_SMALL, padx=10).pack(side=LEFT, padx=(0, 6))
+        Button(btn_frame, text="👁 Revisar lançamentos", command=self._review_selected_fatura,
+               relief="flat", bg=CLR_ACCENT, fg="white", font=FONT_SMALL, padx=10).pack(side=LEFT)
+
+        # Tabela de lançamentos
+        tree_frame = Frame(right, bg=CLR_BG)
+        tree_frame.pack(fill=BOTH, expand=True)
+
+        cols = ("data", "descrição", "valor", "categoria", "parcela")
+        self._fatura_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=18)
+        for col, w, anchor in [
+            ("data",       80,  "center"),
+            ("descrição",  340, "w"),
+            ("valor",      90,  "e"),
+            ("categoria",  140, "w"),
+            ("parcela",    70,  "center"),
+        ]:
+            self._fatura_tree.heading(col, text=col.capitalize())
+            self._fatura_tree.column(col, width=w, anchor=anchor)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._fatura_tree.yview)
+        self._fatura_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=RIGHT, fill=Y)
+        self._fatura_tree.pack(fill=BOTH, expand=True)
+
+        # Rodapé com total calculado
+        foot = Frame(right, bg=CLR_LIGHT, height=28)
+        foot.pack(fill=X)
+        foot.pack_propagate(False)
+        self._fatura_total_var = StringVar(value="")
+        Label(foot, textvariable=self._fatura_total_var, font=FONT_SMALL,
+              bg=CLR_LIGHT, fg=CLR_TEXT).pack(side=RIGHT, padx=12, pady=4)
+
+        # Carrega lista inicial
+        self._refresh_faturas_list()
+
+    def _refresh_faturas_list(self):
+        """Atualiza a lista de PDFs disponíveis em faturas/."""
+        faturas_dir = PROJECT_ROOT / "faturas"
+        faturas_dir.mkdir(exist_ok=True)
+        pdfs = sorted(faturas_dir.glob("*.pdf"))
+
+        self._fatura_listbox.delete(0, "end")
+        self._fatura_pdfs: list[Path] = pdfs
+        for p in pdfs:
+            self._fatura_listbox.insert("end", p.name)
+
+        if not pdfs:
+            self._clear_fatura_detail("Nenhum PDF encontrado em faturas/")
+
+    def _clear_fatura_detail(self, msg: str = ""):
+        for var in self._fatura_meta_labels.values():
+            var.set("—")
+        if msg:
+            self._fatura_meta_labels["arquivo"].set(msg)
+        self._fatura_tree.delete(*self._fatura_tree.get_children())
+        self._fatura_total_var.set("")
+
+    def _on_fatura_select(self, event=None):
+        """Carrega e exibe os detalhes da fatura selecionada."""
+        sel = self._fatura_listbox.curselection()
+        if not sel:
+            return
+        pdf_path = self._fatura_pdfs[sel[0]]
+        self._load_fatura_detail(pdf_path)
+
+    def _load_fatura_detail(self, pdf_path: Path):
+        """Parseia o PDF e preenche os painéis de metadados e lançamentos."""
+        if not PDFPLUMBER_AVAILABLE:
+            messagebox.showerror("Dependência ausente", "Instale pdfplumber: pip install pdfplumber")
+            return
+        try:
+            stem = pdf_path.stem.lower()
+            ano_match = re.search(r"20\d{2}", stem)
+            ref_year  = int(ano_match.group()) if ano_match else dt.date.today().year
+            ref_month = _mes_do_nome(stem)
+
+            meta     = extract_invoice_metadata(str(pdf_path))
+            expenses, _ = parse_pdf_invoice(
+                str(pdf_path),
+                self.db.get_custom_categories(),
+                reference_year=ref_year,
+                reference_month=ref_month,
+            )
+        except Exception as exc:
+            messagebox.showerror("Erro ao ler PDF", str(exc))
+            return
+
+        # Preenche metadados
+        self._fatura_meta_labels["arquivo"].set(pdf_path.name)
+        self._fatura_meta_labels["banco"].set(meta["bank"] or "Não identificado")
+        self._fatura_meta_labels["total"].set(
+            money(meta["total"]) if meta["total"] else "—")
+        self._fatura_meta_labels["venc"].set(meta["due_date"] or "—")
+        self._fatura_meta_labels["fecha"].set(meta["closing_date"] or "—")
+        self._fatura_meta_labels["minimo"].set(
+            money(meta["min_payment"]) if meta["min_payment"] else "—")
+        self._fatura_meta_labels["limite"].set(
+            money(meta["limit"]) if meta["limit"] else "—")
+        self._fatura_meta_labels["lanctos"].set(str(len(expenses)))
+
+        # Preenche tabela de lançamentos
+        self._fatura_tree.delete(*self._fatura_tree.get_children())
+        total_gastos = 0.0
+        for exp in sorted(expenses, key=lambda e: e["date"]):
+            parcela = (f"{exp['installment_number']}/{exp['installments']}"
+                       if exp.get("installments", 1) > 1 else "")
+            tag = "neg" if exp["amount"] < 0 else ("intl" if exp.get("is_foreign") else "")
+            self._fatura_tree.insert("", "end", values=(
+                date_db_to_br(exp["date"]),
+                exp["description"],
+                money(exp["amount"]),
+                exp["category"],
+                parcela,
+            ), tags=(tag,))
+            total_gastos += exp["amount"]
+
+        self._fatura_tree.tag_configure("neg",  foreground=CLR_OK)
+        self._fatura_tree.tag_configure("intl", foreground=CLR_ACCENT)
+        self._fatura_total_var.set(
+            f"Total dos lançamentos: {money(total_gastos)}   |   {len(expenses)} itens")
+
+        # Salva referência para importar depois
+        self._selected_fatura_path = pdf_path
+        self._selected_fatura_expenses = expenses
+        self._selected_fatura_ref = (ref_year, ref_month)
+
+    def _import_selected_fatura(self):
+        """Importa em lote a fatura atualmente exibida."""
+        if not hasattr(self, "_selected_fatura_path"):
+            messagebox.showinfo("Nenhuma fatura", "Selecione uma fatura na lista.")
+            return
+        card_hint = re.sub(r"[_\-\d]", " ", self._selected_fatura_path.stem).strip()
+        card, closing_day = _ask_closing_day(self.root, self.config, card_hint)
+        if card is None:
+            return
+        imported = skipped = 0
+        for exp in self._selected_fatura_expenses:
+            if self.db.expense_exists(exp["date"], exp["description"], exp["amount"], card=card):
+                skipped += 1
+                continue
+            self.db.add_expense_raw(
+                exp["date"], exp["description"], exp["amount"],
+                exp["category"], card=card,
+                installments=exp.get("installments", 1),
+                installment_number=exp.get("installment_number", 1),
+            )
+            imported += 1
+        self.refresh_all()
+        messagebox.showinfo("Importação concluída",
+                            f"✅ Importados: {imported}\n⏭ Duplicatas: {skipped}")
+
+    def _review_selected_fatura(self):
+        """Abre a janela de revisão detalhada da fatura selecionada."""
+        if not hasattr(self, "_selected_fatura_path"):
+            messagebox.showinfo("Nenhuma fatura", "Selecione uma fatura na lista.")
+            return
+        if not self._selected_fatura_expenses:
+            messagebox.showinfo("Sem lançamentos", "Nenhum lançamento foi encontrado neste PDF.")
+            return
+        card_hint = re.sub(r"[_\-\d]", " ", self._selected_fatura_path.stem).strip()
+        card, closing_day = _ask_closing_day(self.root, self.config, card_hint)
+        if card is None:
+            return
+        ref_year, ref_month = self._selected_fatura_ref
+        expenses, raw_text = parse_pdf_invoice(
+            str(self._selected_fatura_path),
+            self.db.get_custom_categories(),
+            reference_year=ref_year,
+            reference_month=ref_month,
+        )
+        _, raw_text = parse_pdf_invoice(str(self._selected_fatura_path),
+                                        self.db.get_custom_categories())
+        _PDFReviewDialog(
+            self.root, expenses, raw_text, self.db,
+            self.db.get_custom_categories(), self.ai, self.refresh_all,
+            card=card, closing_day=closing_day,
+        )
 
     # ------------------------------------------------------------------
     # Tab Análise IA
